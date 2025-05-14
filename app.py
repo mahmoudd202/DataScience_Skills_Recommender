@@ -11,13 +11,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import networkx as nx
 import math
-import os
-
+import logging
 # Set page configuration
 plt.style.use('ggplot')
 
-# Add proper logging
-import logging
 
 logging.basicConfig(
     level=logging.INFO,
