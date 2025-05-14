@@ -608,7 +608,4 @@ def create_interface():
 
     return demo
 
-# Launch the app
-if __name__ == "__main__":
-    demo = create_interface()
-    demo.launch()
+demo = create_interface()
