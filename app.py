@@ -5,6 +5,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 from collections import Counter, defaultdict
 import matplotlib.pyplot as plt
 import re
+import os
+import pickle
 from gensim.models import Word2Vec
 import gradio as gr
 import plotly.express as px
@@ -67,6 +69,21 @@ for skills_text in unique_jobs_df['all_skills']:
     skills_list = [skill for skill in skills_list if skill]  # Remove empty strings
     all_skills_lists.append(skills_list)
 
+model_path = "word2vec_model.model"
+
+if os.path.exists(model_path):
+    word2vec_model = Word2Vec.load(model_path)
+else:
+    word2vec_model = Word2Vec(
+        sentences=all_skills_lists,
+        vector_size=100,
+        window=5,
+        min_count=2,
+        sg=1,
+        workers=4
+    )
+    word2vec_model.save(model_path)
+
 # Load pre-trained Word2Vec model instead of training it
 try:
     logger.info("Loading pre-trained Word2Vec model 🔄")
@@ -76,15 +93,23 @@ except Exception as e:
     logger.error(f"Error loading Word2Vec model: {e}")
     raise
 
-# Build co-occurrence map
-co_occurrence_map = defaultdict(Counter)
-for skill_list in all_skills_lists:
-    cleaned = [re.sub(r'[^\w\s]', '', s).lower().strip() for s in skill_list if s]
-    for skill in set(cleaned):
-        for other in set(cleaned):
-            if skill != other:
-                co_occurrence_map[skill][other] += 1
 
+if os.path.exists("co_occurrence_map.pkl"):
+    with open("co_occurrence_map.pkl", "rb") as f:
+        co_occurrence_map = pickle.load(f)
+else:
+    # Fallback: regenerate it
+    co_occurrence_map = defaultdict(Counter)
+    for skill_list in all_skills_lists:
+        cleaned = [re.sub(r'[^\w\s]', '', s).lower().strip() for s in skill_list if s]
+        for skill in set(cleaned):
+            for other in set(cleaned):
+                if skill != other:
+                    co_occurrence_map[skill][other] += 1
+
+    # Save it
+    with open("co_occurrence_map.pkl", "wb") as f:
+        pickle.dump(co_occurrence_map, f)
 
 class JobSkillsRecommender:
     def __init__(self, job_title_vectors, job_titles, job_skills, vectorizer, word2vec_model):
@@ -608,4 +633,7 @@ def create_interface():
 
     return demo
 
-demo = create_interface()
+#demo = create_interface()
+if __name__ == "__main__":
+    demo = create_interface()
+    demo.launch()
