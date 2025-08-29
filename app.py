@@ -14,9 +14,10 @@ import plotly.graph_objects as go
 import networkx as nx
 import math
 import logging
+from sklearn.cluster import KMeans
+
 # Set page configuration
 plt.style.use('ggplot')
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,7 +74,9 @@ model_path = "word2vec_model.model"
 
 if os.path.exists(model_path):
     word2vec_model = Word2Vec.load(model_path)
+    logger.info("Word2Vec model loaded successfully")
 else:
+    logger.info("Training new Word2Vec model...")
     word2vec_model = Word2Vec(
         sentences=all_skills_lists,
         vector_size=100,
@@ -83,22 +86,16 @@ else:
         workers=4
     )
     word2vec_model.save(model_path)
+    logger.info("Word2Vec model trained and saved")
 
-# Load pre-trained Word2Vec model instead of training it
-try:
-    logger.info("Loading pre-trained Word2Vec model 🔄")
-    word2vec_model = Word2Vec.load("word2vec_model.model")
-    logger.info("Word2Vec model loaded successfully")
-except Exception as e:
-    logger.error(f"Error loading Word2Vec model: {e}")
-    raise
-
-
+# Load or create co-occurrence map
 if os.path.exists("co_occurrence_map.pkl"):
     with open("co_occurrence_map.pkl", "rb") as f:
         co_occurrence_map = pickle.load(f)
+    logger.info("Co-occurrence map loaded")
 else:
-    # Fallback: regenerate it
+    # Create co-occurrence map
+    logger.info("Creating co-occurrence map...")
     co_occurrence_map = defaultdict(Counter)
     for skill_list in all_skills_lists:
         cleaned = [re.sub(r'[^\w\s]', '', s).lower().strip() for s in skill_list if s]
@@ -110,20 +107,38 @@ else:
     # Save it
     with open("co_occurrence_map.pkl", "wb") as f:
         pickle.dump(co_occurrence_map, f)
+    logger.info("Co-occurrence map created and saved")
+
 
 class JobSkillsRecommender:
-    def __init__(self, job_title_vectors, job_titles, job_skills, vectorizer, word2vec_model):
+    def __init__(self, job_title_vectors, job_titles, job_skills, vectorizer, word2vec_model, co_occurrence_map):
         self.job_title_vectors = job_title_vectors
         self.job_titles = job_titles
         self.job_skills = job_skills
         self.vectorizer = vectorizer
         self.word2vec_model = word2vec_model
+        self.co_occurrence_map = co_occurrence_map
         self.all_skills_set = set()
         for skills in job_skills:
             self.all_skills_set.update(self._clean(skill) for skill in skills.split(', '))
 
     def _clean(self, text):
         return re.sub(r'[^\w\s]', '', text).lower().strip()
+
+    def is_job_title_relevant(self, job_title, similarity_threshold=0.1):
+        """Check if the job title is relevant to our dataset"""
+        job_title = job_title.lower().strip()
+
+        # Check for exact match first
+        if job_title in self.job_titles:
+            return True, 1.0
+
+        # Check similarity with existing job titles
+        job_title_vector = self.vectorizer.transform([job_title])
+        similarities = cosine_similarity(job_title_vector, self.job_title_vectors).flatten()
+        max_similarity = np.max(similarities)
+
+        return max_similarity >= similarity_threshold, max_similarity
 
     def get_recommended_skills(self, job_title, top_n=10, similarity_threshold=0.3):
         job_title = job_title.lower()
@@ -166,20 +181,57 @@ class JobSkillsRecommender:
                 continue
 
             # Word2Vec top similar
-            similar = self.word2vec_model.wv.most_similar(base, topn=20)
-            for related, sim in similar:
-                clean_related = self._clean(related)
-                if clean_related in seen:
-                    continue
+            try:
+                similar = self.word2vec_model.wv.most_similar(base, topn=20)
+                for related, sim in similar:
+                    clean_related = self._clean(related)
+                    if clean_related in seen:
+                        continue
 
-                # Keep only skills that co-occur with the seed skill
-                if clean_related in self.co_occurrence_map[base]:
-                    # Score = similarity * co-occurrence count
-                    related_scores[clean_related] += sim * math.log1p(self.co_occurrence_map[base][clean_related]) #Reduces bias toward frequent skills
+                    # Keep only skills that co-occur with the seed skill
+                    if clean_related in self.co_occurrence_map[base]:
+                        # Score = similarity * co-occurrence count
+                        related_scores[clean_related] += sim * math.log1p(self.co_occurrence_map[base][clean_related])
+            except KeyError:
+                continue
 
         # Sort and return top N
         return sorted(related_scores.items(), key=lambda x: -x[1])[:topn_related]
 
+
+# === PART 1 === Huggingface ds_salaries.csv + TF-IDF + KMeans clustering ===
+try:
+    logger.info("Loading Huggingface ds_salaries.csv 🚀")
+    huggingface_df = pd.read_csv("ds_salaries.csv")
+    huggingface_df = huggingface_df[['job_title', 'experience_level', 'salary_in_usd']]
+    logger.info(f"Huggingface dataset loaded with {len(huggingface_df)} entries")
+
+    hug_tfidf_vectorizer = TfidfVectorizer(analyzer='word',
+                                           token_pattern=r'\b[a-zA-Z][a-zA-Z]+\b',
+                                           stop_words='english',
+                                           ngram_range=(1, 2))
+    hug_job_title_vectors = hug_tfidf_vectorizer.fit_transform(huggingface_df['job_title'])
+
+    hug_kmeans = KMeans(n_clusters=5, random_state=42)
+    huggingface_df['cluster'] = hug_kmeans.fit_predict(hug_job_title_vectors)
+
+    mean_salary_per_cluster_level = huggingface_df.groupby(['cluster', 'experience_level'])['salary_in_usd'].mean()
+
+    logger.info("Huggingface cluster + level salary table ready ✅")
+
+except Exception as e:
+    logger.error(f"Error loading Huggingface salary data: {e}")
+    # Create dummy data to prevent crashes
+    huggingface_df = pd.DataFrame({
+        'job_title': ['Data Scientist', 'Software Engineer'],
+        'experience_level': ['MI', 'SE'],
+        'salary_in_usd': [100000, 120000]
+    })
+    hug_tfidf_vectorizer = TfidfVectorizer()
+    hug_job_title_vectors = hug_tfidf_vectorizer.fit_transform(huggingface_df['job_title'])
+    hug_kmeans = KMeans(n_clusters=2, random_state=42)
+    huggingface_df['cluster'] = hug_kmeans.fit_predict(hug_job_title_vectors)
+    mean_salary_per_cluster_level = huggingface_df.groupby(['cluster', 'experience_level'])['salary_in_usd'].mean()
 
 # Initialize the recommender
 recommender = JobSkillsRecommender(
@@ -187,14 +239,12 @@ recommender = JobSkillsRecommender(
     unique_jobs_df['job_title'].tolist(),
     unique_jobs_df['all_skills'].tolist(),
     tfidf_vectorizer,
-    word2vec_model
+    word2vec_model,
+    co_occurrence_map
 )
-
-recommender.co_occurrence_map = co_occurrence_map
 
 
 # Create visualizations for Gradio UI
-# Add error handling for better stability
 def create_skill_frequency_chart(skill_counts, title="Top Skills by Frequency"):
     if not skill_counts:
         fig = px.bar(
@@ -252,6 +302,12 @@ def create_skills_network(seed_skills, related_skills, title="Skills Relationshi
             if skill_clean in recommender.co_occurrence_map.get(seed_clean, {}):
                 weight = recommender.co_occurrence_map[seed_clean][skill_clean]
                 G.add_edge(seed, skill, weight=weight)
+
+    if len(G.nodes()) == 0:
+        # Return empty plot if no nodes
+        fig = go.Figure()
+        fig.update_layout(title="No network data available")
+        return fig
 
     # Generate layout
     pos = nx.spring_layout(G, k=0.3, iterations=50)
@@ -331,86 +387,92 @@ def create_skills_network(seed_skills, related_skills, title="Skills Relationshi
 
     return fig
 
-def get_job_recommendations(job_title, number_of_skills=10, similarity_threshold=0.3):
-    recommended_skills, skill_counts, similar_jobs, related_skills = recommender.get_recommended_skills(
-        job_title,
-        top_n=number_of_skills,
-        similarity_threshold=similarity_threshold
-    )
 
-    # Create output components
-    job_html = ""
-    if similar_jobs:
-        job_html = "<div style='margin-bottom: 20px;'>"
-        job_html += f"<h3>Similar Job Titles</h3>"
-        job_html += "<ul style='list-style-type: disc; padding-left: 20px;'>"
-        for job in similar_jobs:
-            job_html += f"<li>{job}</li>"
-        job_html += "</ul></div>"
-    else:
-        job_html = "<div style='margin-bottom: 20px;'>"
-        job_html += f"<h3>No exact matches found</h3>"
-        job_html += "<p>Showing general skill recommendations based on all jobs.</p>"
-        job_html += "</div>"
+def estimate_salary(job_title_input, experience_level_input):
+    try:
+        job_title_input = job_title_input.strip().lower()
 
-    # Create skills table
-    skills_html = "<div style='margin-bottom: 20px;'>"
-    skills_html += f"<h3>Top {len(recommended_skills)} Recommended Skills</h3>"
-    skills_html += "<table style='width: 100%; border-collapse: collapse;'>"
-    skills_html += "<tr style='background-color: #f2f2f2;'><th style='padding: 10px; text-align: left; border: 1px solid #ddd;'>Skill</th><th style='padding: 10px; text-align: left; border: 1px solid #ddd;'>Frequency</th></tr>"
+        # First check if the job title is relevant using our main recommender
+        is_relevant, similarity_score = recommender.is_job_title_relevant(job_title_input, similarity_threshold=0.1)
 
-    for skill in recommended_skills:
-        skills_html += f"<tr><td style='padding: 10px; border: 1px solid #ddd;'>{skill}</td><td style='padding: 10px; border: 1px solid #ddd;'>{skill_counts[skill]}</td></tr>"
+        if not is_relevant:
+            return "💰 Estimated Salary: job title not found in our database. Please try a more common job title. "
 
-    skills_html += "</table></div>"
+        job_vector = hug_tfidf_vectorizer.transform([job_title_input])
+        predicted_cluster = hug_kmeans.predict(job_vector)[0]
 
-    # Create related skills table
-    related_html = ""
-    if related_skills:
-        related_html = "<div style='margin-bottom: 20px;'>"
-        related_html += f"<h3>Top {len(related_skills)} Related Skills (by Word2Vec)</h3>"
-        related_html += "<table style='width: 100%; border-collapse: collapse;'>"
-        related_html += "<tr style='background-color: #f2f2f2;'><th style='padding: 10px; text-align: left; border: 1px solid #ddd;'>Skill</th><th style='padding: 10px; text-align: left; border: 1px solid #ddd;'>Relevance Score</th></tr>"
+        try:
+            estimated_salary = mean_salary_per_cluster_level.loc[(predicted_cluster, experience_level_input)]
+            estimated_salary = round(estimated_salary, 2)
+            logger.info(
+                f"Estimated salary for '{job_title_input}' at level '{experience_level_input}' → ${estimated_salary}")
+            return f"💰 Estimated Salary: ${estimated_salary:,.2f} (Confidence: {similarity_score:.2f})"
+        except KeyError:
+            logger.warning(f"No salary data for cluster {predicted_cluster} and level '{experience_level_input}'")
+            return f"💰 Estimated Salary: Not available for this experience level"
+    except Exception as e:
+        logger.error(f"Error estimating salary: {e}")
+        return f"💰 Estimated Salary: Error occurred during estimation"
 
-        for skill, score in related_skills:
-            related_html += f"<tr><td style='padding: 10px; border: 1px solid #ddd;'>{skill}</td><td style='padding: 10px; border: 1px solid #ddd;'>{score:.3f}</td></tr>"
 
-        related_html += "</table></div>"
+def get_comprehensive_analysis(job_title, experience_level, number_of_skills=10, similarity_threshold=0.3):
+    """Combined function that returns both skills recommendations and salary estimation"""
+    try:
+        # Get skills recommendations
+        recommended_skills, skill_counts, similar_jobs, related_skills = recommender.get_recommended_skills(
+            job_title,
+            top_n=number_of_skills,
+            similarity_threshold=similarity_threshold
+        )
 
-    # Create visualizations
-    freq_chart = create_skill_frequency_chart(skill_counts, title=f"Top Skills for '{job_title}'")
-    network_chart = create_skills_network(recommended_skills, related_skills)
+        # Show salary only if there are similar jobs
+        if similar_jobs:
+            salary_estimate = estimate_salary(job_title, experience_level)
+        else:
+            salary_estimate = "💰 Estimated Salary: Not shown due to lack of similar job matches"
 
-    html_output = html_output = f"""
-            <div style='font-family: Arial, sans-serif; padding: 20px;'>
 
-                <div style='margin-bottom: 25px;'>
-                    <h2 style='color: #2c3e50;'>🔍 Similar Job Titles</h2>
-                    {"<ul>" + "".join(f"<li>{job}</li>" for job in similar_jobs) + "</ul>" if similar_jobs else "<p style='color: #888;'>No exact matches. Showing general suggestions.</p>"}
-                </div>
+        # Create visualizations
+        freq_chart = create_skill_frequency_chart(skill_counts, title=f"Top Skills for '{job_title}'")
+        network_chart = create_skills_network(recommended_skills, related_skills)
 
-                <div style='margin-bottom: 25px;'>
-                    <h2 style='color: #2c3e50;'>⭐ Top {len(recommended_skills)} Recommended Skills</h2>
-                    <div style='display: flex; flex-wrap: wrap; gap: 10px;'>
-                        {"".join(f"<div style='background-color:#ecf0f1;padding:10px 15px;border-radius:8px;border:1px solid #ccc;font-weight:bold;color:#2c3e50;'>{skill} <span style='color:#888;font-weight:normal'>(x{skill_counts[skill]})</span></div>" for skill in recommended_skills)}
-                    </div>
-                </div>
+        html_output = f"""
+        <div style='font-family: Arial, sans-serif; padding: 20px;'>
 
-                <div style='margin-bottom: 25px;'>
-                    <h2 style='color: #2c3e50;'>🧠 Related Skills (by Word2Vec)</h2>
-                    <div style='display: flex; flex-wrap: wrap; gap: 10px;'>
-                        {"".join(f"<div style='background-color:#f9f9f9;padding:10px 15px;border-radius:8px;border:1px solid #ddd;color:#34495e;'>{skill} <span style='font-size: 0.9em; color:#888;'>(score {score:.2f})</span></div>" for skill, score in related_skills)}
-                    </div>
-                </div>
-
+            <div style='margin-bottom: 25px; padding: 15px; background-color: #e8f5e8; border-radius: 10px; border-left: 5px solid #27ae60;'>
+                <h2 style='color: #27ae60; margin-top: 0;'>{salary_estimate}</h2>
             </div>
-            """
+
+            <div style='margin-bottom: 25px;'>
+                <h2 style='color: #2c3e50;'>🔍 Similar Job Titles</h2>
+                {"<ul>" + "".join(f"<li>{job}</li>" for job in similar_jobs) + "</ul>" if similar_jobs else "<p style='color: #888;'>No exact matches. Showing general suggestions.</p>"}
+            </div>
+
+            <div style='margin-bottom: 25px;'>
+                <h2 style='color: #2c3e50;'>⭐ Top {len(recommended_skills)} Recommended Skills</h2>
+                <div style='display: flex; flex-wrap: wrap; gap: 10px;'>
+                    {"".join(f"<div style='background-color:#ecf0f1;padding:10px 15px;border-radius:8px;border:1px solid #ccc;font-weight:bold;color:#2c3e50;'>{skill} <span style='color:#888;font-weight:normal'>(x{skill_counts[skill]})</span></div>" for skill in recommended_skills)}
+                </div>
+            </div>
+
+            <div style='margin-bottom: 25px;'>
+                <h2 style='color: #2c3e50;'>🧠 Related Skills (by Word2Vec)</h2>
+                <div style='display: flex; flex-wrap: wrap; gap: 10px;'>
+                    {"".join(f"<div style='background-color:#f9f9f9;padding:10px 15px;border-radius:8px;border:1px solid #ddd;color:#34495e;'>{skill} <span style='font-size: 0.9em; color:#888;'>(score {score:.2f})</span></div>" for skill, score in related_skills)}
+                </div>
+            </div>
+
+        </div>
+        """
+
+        return html_output, freq_chart, network_chart
+    except Exception as e:
+        error_msg = f"<div style='color: red; padding: 20px;'>Error occurred: {str(e)}</div>"
+        empty_fig = go.Figure()
+        return error_msg, empty_fig, empty_fig
 
 
-    return html_output, freq_chart, network_chart
-
-
-# Define custom CSS - stored in separate file for better IDE handling
+# Define custom CSS
 def get_custom_css():
     return """
     body {
@@ -506,7 +568,6 @@ def get_custom_css():
     .tabs {
         min-height: 25vh;
         padding-bottom: 40px;
-
     }
 
     .footer {
@@ -523,22 +584,21 @@ def get_custom_css():
 custom_css = get_custom_css()
 
 
-# Add a theme selector
+# Create interface
 def create_interface():
-
     with gr.Blocks(css=custom_css, theme=gr.themes.Default()) as demo:
         with gr.Row():
             gr.Markdown(
                 """
-                # 🚀 Job Skills Recommender
-                ### Find the most relevant skills for your target job role
+                # 🚀 Job Skills Recommender & Salary Estimator
+                ### Find the most relevant skills and estimated salary for your target job role
                 """
             )
 
         gr.Markdown(
             """
-            This tool analyzes a large dataset of job postings to recommend the most valuable skills for your career.
-            Enter a job title below and discover which skills will help you stand out to employers!
+            This tool analyzes a large dataset of job postings to recommend the most valuable skills for your career and estimates potential salary.
+            Enter a job title below and discover which skills will help you stand out to employers, plus get salary insights!
             """
         )
 
@@ -551,6 +611,20 @@ def create_interface():
                 )
 
                 with gr.Row():
+                    with gr.Column(scale=1):
+                        experience_level_input = gr.Dropdown(
+                            label="Experience Level",
+                            choices=[
+                                ('Entry Level', 'EN'),
+                                ('Mid Level', 'MI'),
+                                ('Senior Level', 'SE'),
+                                ('Executive Level', 'EX')
+                            ],
+                            value='EN',
+                            interactive=True,
+                            info="Please select your experience level"
+                        )
+
                     with gr.Column(scale=1):
                         skills_count = gr.Slider(
                             minimum=5,
@@ -569,69 +643,86 @@ def create_interface():
                             label="Job Title Similarity Threshold"
                         )
 
-                submit_btn = gr.Button("Get Skill Recommendations", variant="primary")
+                submit_btn = gr.Button("Get Complete Analysis", variant="primary", size="lg")
 
             with gr.Column(scale=2):
                 gr.Markdown(
                     """
                     ### How to use this tool:
 
-                    1. Enter a job title you're interested in
-                    2. Adjust the number of skills you want to see
-                    3. Click "Get Skill Recommendations" to analyze
-                    4. Explore the recommended skills and visualizations
+                    1. **Enter a job title** you're interested in
+                    2. **Select your experience level** for salary estimation
+                    3. **Adjust settings** (optional):
+                       - Number of skills to recommend
+                       - Similarity threshold for job matching
+                    4. **Click "Get Complete Analysis"** to see:
+                       - Estimated salary range
+                       - Recommended skills
+                       - Interactive visualizations
 
-                    This tool uses AI-powered analysis of job postings to suggest skills that are most relevant to your career goals.
+                    This tool uses AI-powered analysis of real job postings to provide insights that are most relevant to your career goals.
                     """
                 )
 
         with gr.Tabs() as tabs:
-            with gr.TabItem("Overview"):
-                html_output = gr.HTML(label="Recommended Skills")
+            with gr.TabItem("📊 Complete Analysis"):
+                html_output = gr.HTML(label="Analysis Results")
 
-            with gr.TabItem("Skill Frequency Chart"):
+            with gr.TabItem("📈 Skill Frequency Chart"):
                 freq_chart = gr.Plot(label="Skill Frequency")
 
-            with gr.TabItem("Skills Network"):
+            with gr.TabItem("🕸️ Skills Network"):
                 network_chart = gr.Plot(label="Skills Network Graph")
 
-            with gr.TabItem("About"):
+            with gr.TabItem("ℹ️ About"):
                 gr.Markdown(
                     """
-                    ### 📊 About the Data
+                    ### 📊 About the Data & Methods
 
-                    This recommender system analyzes thousands of real job postings from LinkedIn to find the most frequently 
-                    requested skills for each job title. It uses natural language processing (NLP) and machine learning 
-                    to understand how skills relate to each other.
+                    This recommender system analyzes thousands of real job postings from LinkedIn and salary data to provide comprehensive career insights.
+
+                    **Key Features:**
+
+                    - **Skills Recommendation**: Uses TF-IDF vectorization and Word2Vec to find the most relevant skills
+                    - **Salary Estimation**: K-means clustering on job titles with experience level adjustment
+                    - **Relevance Filtering**: Only provides salary estimates for job titles found in our database
+                    - **Network Analysis**: Visualizes how skills relate to each other based on co-occurrence
 
                     **Technical Details:**
 
-                    - **Word2Vec Model**: Used to understand semantic relationships between skills
-                    - **TF-IDF Vectorization**: For job title similarity matching
-                    - **Network Analysis**: To visualize skill relationships and co-occurrences
-                    - **Data Source**: LinkedIn job postings dataset
+                    - **Word2Vec Model**: Semantic relationships between skills
+                    - **TF-IDF Vectorization**: Job title similarity matching
+                    - **K-means Clustering**: Groups similar roles for salary estimation
+                    - **Co-occurrence Analysis**: Skills that frequently appear together
+                    - **Data Sources**: LinkedIn job postings + salary datasets
 
-                    For technical roles, both hard skills (programming languages, tools) and soft skills 
-                    (communication, teamwork) are considered.
+                    **Experience Levels:**
+                    - **EN (Entry Level)**: 0-2 years of experience
+                    - **MI (Mid Level)**: 2-5 years of experience  
+                    - **SE (Senior Level)**: 5+ years of experience
+                    - **EX (Executive Level)**: Leadership/C-level positions
+
+                    For best results, use common job titles like "Data Scientist", "Software Engineer", "Product Manager", etc.
                     """
                 )
 
         gr.Markdown(
             """
             <div class="footer">
-            Developed with tears using Gradio | Dataset sourced from LinkedIn job postings | Last updated: May 2025
+            Developed with ❤️ using Gradio | Dataset sourced from LinkedIn job postings & salary data | Last updated: May 2025
             </div>
             """
         )
 
-        # Set up the function call
+        # Set up the function calls - now using the combined function
         submit_btn.click(
-            get_job_recommendations,
-            inputs=[job_title_input, skills_count, similarity_slider],
+            get_comprehensive_analysis,
+            inputs=[job_title_input, experience_level_input, skills_count, similarity_slider],
             outputs=[html_output, freq_chart, network_chart]
         )
 
     return demo
+
 
 if __name__ == "__main__":
     demo = create_interface()
