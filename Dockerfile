@@ -22,9 +22,9 @@ COPY . .
 
 # Download large model files from Google Drive using gdown
 # Word2Vec model
-RUN gdown --id 12hsFkFMarwXpaQsAzHTkxEySZ6g020My -O word2vec_model.model
+RUN gdown --id 1QtJ9IOhqJnnit9RFW-QgClsE7XSZyV3- -O word2vec_model.model
 # Co-occurrence map
-RUN gdown --id 19LUbJmhcPB_OHNYsIHwTf-ROqTfZzTAp -O co_occurrence_map.pkl
+RUN gdown --id 1m76nH2MtGb4XDwfxlmjNCNdOFkkF6EKx -O co_occurrence_map.pkl
 
 # Install Python packages
 RUN pip install -r requirements.txt
